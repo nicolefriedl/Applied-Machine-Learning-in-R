@@ -1,0 +1,606 @@
+---
+title: "Homework Unit 8: Advanced Performance Metrics"
+author: "Nicole Friedl"
+date: "`r lubridate::today()`"
+format: 
+  html: 
+    embed-resources: true
+    toc: true 
+    toc_depth: 4
+editor_options: 
+  chunk_output_type: console
+---
+
+## Introduction
+
+To begin, download the following from the course web book (Unit 8):
+
+* `hw_unit_8_performance.qmd` (notebook for this assignment)
+
+* `breast_cancer.csv` (data for this assignment)
+
+The data for this week's assignment has information about breast cancer diagnoses. It contains characteristics of different breast cancer tumors and classifies the tumor as benign or malignant. Your goal is to choose among two candidate statistical algorithms (general GLM vs a tuned KNN model) to identify and evaluate the best performing model for diagnosis. 
+
+You can imagine that the consequences of missing cancerous tumors are not equal to the consequences of misdiagnosing benign tumors. In this assignment, we will explore how the performance metric and balance of diagnoses affect our evaluation of best performing model in this data.
+
+*NOTE:* Fitting models in this assignment will generate some warnings having to do with `glm.fit`. This is to be expected, and we are going to review these warnings and some related issues in our next lab.
+
+Let's get started!
+
+-----
+
+##  Setup
+
+Set up your notebook in this section. You will want to set your path and initiate parallel processing here!
+
+```{r}
+options(conflicts.policy = "depends.ok")
+devtools::source_url("https://github.com/jjcurtin/lab_support/blob/main/fun_ml.R?raw=true")
+tidymodels_conflictRules()
+
+library(tidyverse)
+library(tidymodels)
+library(discrim, exclude = "smoothness")
+library(skimr)
+library(future)
+library(rsample)
+library(cowplot, include.only = c("plot_grid", "theme_half_open"))
+library(corrplot, include.only = "corrplot.mixed")
+library(ggplot2)
+library(xfun, include.only = "cache_rds")
+
+devtools::source_url("https://github.com/jjcurtin/lab_support/blob/main/fun_plots.R?raw=true")
+devtools::source_url("https://github.com/jjcurtin/lab_support/blob/main/fun_eda.R?raw=true")
+
+options(tibble.width = Inf, dplyr.print_max=Inf)
+rerun_setting <- FALSE
+
+# cl <- parallel::makePSOCKcluster(parallel::detectCores(logical = FALSE))
+# doParallel::registerDoParallel(cl)
+
+plan(multisession, workers = parallel::detectCores(logical = FALSE))
+#I was getting warning messages so I went back into John's lecture about parallel processing and some methods prefer future instead of backend, so I did it this way. 
+
+path_data <- "homework/data"
+```
+
+
+
+## Read in your data
+
+Read in the `breast_cancer.csv` data file and save as an object called `data_all`, perform any checks needed on the data (i.e., light *cleaning* EDA) and set the outcome `diagnosis` as a factor with malignant as the first level.
+
+```{r}
+data_all <- read_csv(here::here(path_data, "breast_cancer.csv"),
+                     show_col_types = FALSE) |> 
+  glimpse()
+
+data_all <- data_all |>
+  mutate(diagnosis = factor(diagnosis, levels = c("malignant", "benign")))
+
+str(data_all$diagnosis)
+
+sum(is.na(data_all))
+
+summary(data_all)
+
+table(data_all$diagnosis)
+prop.table(table(data_all$diagnosis))
+```
+
+
+Print a table to see the balance of positive and negative diagnosis cases.
+
+```{r}
+data_all |> tab(diagnosis)
+```
+
+
+What do you notice about the distribution of your outcome variable? Do you have any concerns?   
+
+*We have more benign than malignant. It is concerning since it is unbalanced and could be misleading.*
+
+
+## Split data into train and test
+
+Hold out 1/3 of the data as a test set for evaluation using the `initial_split()` function. Use the provided seed. Stratify on diagnosis.
+```{r}
+set.seed(12345)
+
+splits_test <- data_all |> 
+  initial_split(prop = 2/3, strata = "diagnosis")
+
+data_trn <- splits_test |> 
+  analysis()
+
+data_test <- splits_test |> 
+  assessment()
+```
+
+
+## Light Modeling EDA
+
+Look at correlations between predictors in `data_train`.
+```{r}
+cor_matrix <- data_trn |> 
+  select(where(is.numeric)) |> 
+  cor(use = "pairwise.complete.obs")
+
+corrplot::corrplot(cor_matrix, 
+                  method = "circle",      
+                  type = "upper",         
+                  tl.col = "black",      
+                  tl.srt = 45,           
+                  tl.cex = 0.6,          
+                  diag = FALSE,           
+                  mar = c(0,0,1,0))       
+```
+
+
+Visualize the variance of your predictors in `data_train`.
+```{r}
+data_trn |> 
+  select(where(is.numeric)) |> 
+  gather(key = "variable", value = "value") |> 
+  ggplot(aes(x = variable, y = value)) + 
+  geom_boxplot() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "Variance of Numeric Predictors",
+       x = "Predictor Variable",
+       y = "Value")
+```
+
+
+Now, answer the following questions:    
+
+
+Why should you be looking at variance of your predictors?
+
+*If a predictor has very low variance, it means that the values of that predictor do not change much across the dataset. This could make it a poor feature for a model since it won't provide much information to distinguish between different outcomes. In such cases, the predictor could be dropped.*
+
+
+If you had concerns about the variance of your predictors, what would you do?
+
+*Extreme values or outliers in a predictor can greatly influence certain models, especially those sensitive to outliers (e.g., linear regression). By visualizing the variance and distribution of predictors (e.g., using boxplots), I can identify outliers and take appropriate action, such as transforming the variable or removing extreme values.*
+
+
+Do you have concerns about the variance of your predictors in these data?
+
+*High variance in a predictor often indicates that the feature provides significant information to the model. On the other hand, predictors with little variance may not contribute much to the predictive power of the model.*
+
+## GLM vs KNN
+
+In this part of this assignment, you will compare the performance of a standard GLM model vs a KNN model (tuned for neighbors) for predicting breast cancer diagnoses from all available predictors. You will choose between these models using bootstrapped resampling, and evaluate the final performance of your model in the held out test set created earlier in this script. You will now select and evaluate models using ROC AUC instead of accuracy.
+
+### Bootstrap splits
+
+Split `data_train` into 100 bootstrap samples stratified on diagnosis. Use the provided seed.
+```{r}
+set.seed(12345)
+
+splits_boot <- data_trn |> 
+  bootstraps(times = 100, strata = "diagnosis")  
+
+grid_glmnet <- expand_grid(penalty = exp(seq(-8, 3, length.out = 200)),
+                           mixture = seq(0, 1, length.out = 6))
+```
+
+
+### Build recipes
+
+Write 2 recipes (one for GLM, one for KNN) to predict breast cancer diagnosis from all predictors in `data_train`. Include the minimal necessary steps for each algorithm, including what you learned from your light EDA above.
+```{r}
+library(themis)
+
+rec_glm <- recipe(diagnosis ~ ., data = data_trn) |> 
+  step_impute_median(all_numeric_predictors()) |> 
+  step_impute_mode(all_nominal_predictors()) |> 
+  step_dummy(all_nominal_predictors()) |> 
+  step_normalize(all_predictors())
+
+rec_knn <- recipe(diagnosis ~ ., data = data_trn) |> 
+  step_impute_median(all_numeric_predictors()) |> 
+  step_impute_mode(all_nominal_predictors()) |> 
+  step_normalize(all_numeric_predictors()) 
+```
+
+
+### Fit GLM
+
+Fit a logistic regression classifier using the recipe you created and your bootstrap splits. Use ROC AUC (`roc_auc`) as your performance metric.
+
+```{r}
+fits_glmnet <- cache_rds(
+  expr = {
+    logistic_reg(penalty = tune(), 
+                 mixture = tune()) |> 
+      set_engine("glmnet") |> 
+      set_mode("classification") |> 
+      tune_grid(preprocessor = rec_glm, 
+                resamples = splits_boot, grid = grid_glmnet, 
+                metrics = metric_set(roc_auc))
+
+  },
+  rerun = rerun_setting,
+  dir = "cache/008/",
+  file = "fits_glmnet_auc")
+```
+
+Print the average ROC AUC of your logistic regression model.
+```{r}
+fits_glmnet %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  summarize(mean_roc_auc = mean(mean))
+```
+
+
+### Fit KNN
+
+Set up a hyperparameter grid to consider a range of values for `neighbors` in your KNN models.
+```{r}
+grid_knn <- expand_grid(neighbors = seq(1, 20, by = 1))  
+```
+
+Fit a KNN model using the recipe you created and your bootstrap splits. Use ROC AUC (`roc_auc`) as your performance metric.  
+```{r}
+fits_knn <- cache_rds(
+  expr = {
+    nearest_neighbor(neighbors = tune()) |> 
+      set_engine("kknn") |> 
+      set_mode("classification") |> 
+      tune_grid(preprocessor = rec_knn, 
+                resamples = splits_boot, grid = grid_knn, 
+                metrics = metric_set(roc_auc))
+  },
+  dir = "cache/008/",
+  file = "fits_knn_auc",
+  rerun = rerun_setting)
+```
+
+Generate a plot to help you determine if you considered a wide enough range of values for `neighbors`.
+```{r}
+plot_hyperparameters(tune_fit = fits_knn, 
+                     hp1 = "neighbors", 
+                     metric = "roc_auc", 
+                     log_hp1 = FALSE)  
+```
+
+
+Print the best value for the `neighbors` hyperparameter across resamples based on model ROC AUC.
+```{r}
+best_knn <- fits_knn %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  group_by(neighbors) %>%
+  summarize(mean_roc_auc = mean(mean)) %>%
+  arrange(desc(mean_roc_auc)) %>%
+  slice(1)
+```
+
+Print the average ROC AUC of your best KNN regression model
+```{r}
+best_knn_m <- best_knn %>%
+  summarize(mean_roc_auc = mean(mean_roc_auc))
+
+best_knn_m
+```
+
+
+### Select and fit best model
+
+Now you will select your best model configuration among the various KNN and GLM models based on overall ROC AUC and train it on your full training sample.     
+
+Create training (`feat_train`) and test (`feat_test`) feature matrices using your best recipe (GLM or KNN)
+```{r}
+feat_train <- rec_knn %>% 
+  prep() %>% 
+  bake(new_data = data_trn)
+
+feat_test <- rec_knn %>% 
+  prep() %>% 
+  bake(new_data = data_test)
+```
+
+Fit your best performing model on the full training sample (`feat_train`).
+```{r}
+best_knn_model <- nearest_neighbor(neighbors = best_knn$neighbors) %>%
+  set_engine("kknn") %>%
+  set_mode("classification") %>%
+  fit(diagnosis ~ ., data = feat_train)
+```
+
+### Evaluate the best model
+
+Make a figure to plot the ROC of your best model in the test set.
+```{r}
+knn_preds <- predict(best_knn_model, new_data = feat_test, type = "prob")
+
+results <- data.frame(
+  True_Label = feat_test$diagnosis,
+  Pred_Prob = knn_preds$.pred_malignant
+)
+
+plot_scatter(results, "True_Label", "Pred_Prob")
+```
+
+
+Generate a confusion matrix depicting your model's performance in test.
+```{r}
+knn_preds_class <- predict(best_knn_model, feat_test)$.pred_class
+
+cm_knn <- tibble(
+  truth = feat_test$diagnosis,
+  estimate = knn_preds_class
+) %>%
+  conf_mat(truth, estimate)
+
+cm_knn
+```
+
+
+Make a plot of your confusion matrix.
+```{r}
+autoplot(cm_knn)
+```
+
+
+Report the ROC AUC, accuracy, sensitivity, specificity, PPV, and NPV of your best model in the held out test set.
+```{r}
+cm_knn |> 
+  summary() |>
+  filter(.metric == "ppv" | .metric == "npv") |> 
+  select(-.estimator)
+
+cm_knn |> 
+  summary() |> 
+  filter(.metric == "sens" | .metric == "spec" | .metric == "bal_accuracy") |> 
+  select(-.estimator)
+```
+
+## Part 2: Addressing class imbalance
+
+Since only 15% of our cases our malignant, let's see if we can achieve higher sensitivity by up-sampling our data with SMOTE. We will again select between a standard GLM vs tuned KNN using bootstrapped CV and evaluate our best model in test.
+
+### Build recipes
+
+Update your previous recipes to up-sample the minority class (malignant) in diagnosis using `step_smote().` Remember to make 2 recipes (one for GLM, one for KNN).
+
+I read ahead in lecture and had already applied this to my old recipe, but I went back and applied it here instead. No wonder my model was already performing so well. 
+```{r}
+rec_knn_1 <- recipe(diagnosis ~ ., data = data_trn) |> 
+  step_impute_median(all_numeric_predictors()) |> 
+  step_impute_mode(all_nominal_predictors()) |> 
+  step_normalize(all_numeric_predictors()) |> 
+  step_smote(diagnosis)  
+
+rec_glm_2 <- recipe(diagnosis ~ ., data = data_trn) |> 
+  step_impute_median(all_numeric_predictors()) |> 
+  step_impute_mode(all_nominal_predictors()) |> 
+  step_dummy(all_nominal_predictors()) |>  
+  step_normalize(all_predictors()) |> 
+  step_smote(diagnosis)
+```
+
+
+### Fit GLM
+
+Fit an up-sampled logistic regression classifier using the new GLM recipe you created and your bootstrap splits. Use ROC AUC as your performance metric.
+```{r}
+fits_glmnet_up <- cache_rds(
+  expr = {
+    logistic_reg(penalty = tune(), 
+                 mixture = tune()) |>  
+      set_engine("glmnet") |> 
+      set_mode("classification") |> 
+      tune_grid(
+        preprocessor = rec_glm_2,  
+        resamples = splits_boot, 
+        grid = grid_glmnet,  
+        metrics = metric_set(roc_auc)  
+      )
+  },
+  rerun = rerun_setting,
+  dir = "cache/008/",
+  file = "fit_glmnet_up"
+)
+```
+
+Print the average ROC AUC of your logistic regression model 
+```{r}
+fits_glmnet_up %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  summarize(mean_roc_auc = mean(mean))
+```
+
+
+### Fit KNN
+
+Set up a hyperparameter grid to consider a range of values for `neighbors` in your KNN models.
+```{r}
+grid_knn_up <- expand_grid(neighbors = seq(1, 20, by = 1))  
+```
+
+Fit an up-sampled KNN using the new KNN recipe you created and your bootstrap splits. Use ROC AUC as your performance metric. 
+```{r}
+fits_knn_up <- cache_rds(
+  expr = {
+    nearest_neighbor(neighbors = tune()) |> 
+      set_engine("kknn") |> 
+      set_mode("classification") |> 
+      tune_grid(
+        preprocessor = rec_knn_1,  
+        resamples = splits_boot, 
+        grid = grid_knn_up,  
+        metrics = metric_set(roc_auc)  
+      )
+  },
+  dir = "cache/008/",
+  file = "fits_knn_auc",
+  rerun = rerun_setting
+)
+```
+
+Generate a plot to help you determine if you considered a wide enough range of values for `neighbors`.
+```{r}
+plot_hyperparameters(tune_fit = fits_knn_up, 
+                     hp1 = "neighbors", 
+                     metric = "roc_auc", 
+                     log_hp1 = FALSE) 
+```
+
+Print the best value for the `neighbors` hyperparameter across resamples based on model ROC AUC.
+```{r}
+best_knn_2 <- fits_knn_up %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  group_by(neighbors) %>%
+  summarize(mean_roc_auc = mean(mean)) %>%
+  arrange(desc(mean_roc_auc)) %>%
+  slice(1)  
+```
+
+
+Print the average ROC AUC of your best KNN regression model
+```{r}
+best_knn_up_1 <- best_knn_2 %>%
+  pull(mean_roc_auc)  
+```
+
+### Select and fit the best model
+
+Create the up-sampled training feature matrix using your best recipe (GLM or KNN). *Remember, do not upsample your test data!*
+```{r}
+feat_train_up <- rec_knn_1 %>%
+  prep(training = data_trn) %>%
+  bake(new_data = NULL)
+```
+
+
+Fit your best performing up-sampled model on the full training sample.
+```{r}
+fits_knn_up_2 <- cache_rds(
+  expr = {
+    nearest_neighbor(neighbors = tune()) |> 
+      set_engine("kknn") |> 
+      set_mode("classification") |> 
+      tune_grid(
+        preprocessor = rec_knn_1,  
+        resamples = splits_boot, 
+        grid = grid_knn_up,  
+        metrics = metric_set(roc_auc)
+      )
+  },
+  dir = "cache/008/",
+  file = "fits_knn_auc",
+  rerun = rerun_setting
+)
+```
+
+### Evaluate the best model
+
+Make a figure to plot the ROC of your best ups-ampled model in the test set.
+```{r}
+results_2 <- tibble(
+  True_Label = feat_test$diagnosis,
+  Pred_Prob = knn_preds$.pred_malignant
+)
+
+plot_scatter(results_2, "True_Label", "Pred_Prob")
+```
+
+
+Generate a confusion matrix depicting your up-sampled model's performance in test.
+```{r}
+knn_preds_class_2 <- predict(best_knn_model, feat_test)$.pred_class
+
+cm_knn_2 <- tibble(
+  truth = feat_test$diagnosis,
+  estimate = knn_preds_class_2  
+) %>%
+  conf_mat(truth, estimate)
+
+cm_knn_2
+```
+
+
+Make a plot of your confusion matrix.
+```{r}
+autoplot(cm_knn_2)
+```
+
+
+Report the ROC AUC, accuracy, sensitivity, specificity, PPV, and NPV of your best up-sampled model in the held out test set.
+```{r}
+cm_knn_2 |> 
+  summary() |>
+  filter(.metric %in% c("ppv", "npv")) |>  
+  select(-.estimator)
+
+cm_knn_2 |> 
+  summary() |> 
+  filter(.metric %in% c("sens", "spec", "bal_accuracy")) |>  
+  select(-.estimator)
+```
+
+
+
+## Part 3: New Classification Threshold
+
+Now you want to check if there may be an additional benefit for your model's performance if you adjust the classification threshold from its default 50% to a threshold of 40%
+
+### 1) Adjust  classification threshold to 40%
+
+Make a tibble containing the following variables -
+
+* truth: The true values of diagnosis in your test set
+* prob: The predicted probabilities made by your best up-sampled model above in the test set
+* estimate_40: Binary predictions of `diagnosis` (benign vs malignant) created by applying a threshold of 40% to your best model's predicted probabilities.
+```{r}
+knn_preds_prob <- predict(best_knn_model, feat_test, type = "prob")
+
+threshold_40_tibble <- tibble(
+  truth = feat_test$diagnosis,
+  prob = knn_preds_prob$.pred_malignant,  
+  estimate_40 = if_else(knn_preds_prob$.pred_malignant >= 0.40, "malignant", "benign")
+)
+
+threshold_40_tibble
+```
+
+### 2) Evaluate model at new threshold
+
+Generate a confusion matrix depicting your up-sampled model's performance in test at your new threshold.
+```{r}
+cm_knn_40 <- tibble(
+  truth = factor(threshold_40_tibble$truth, levels = c("malignant", "benign")),
+  estimate = factor(threshold_40_tibble$estimate_40, levels = c("malignant", "benign"))
+) %>%
+  conf_mat(truth, estimate)
+
+cm_knn_40
+```
+
+
+Make a plot of your confusion matrix.
+```{r}
+autoplot(cm_knn_40)
+```
+
+
+Report the ROC AUC, accuracy, sensitivity, specificity, PPV, and NPV of your best up-sampled model in the held-out test set.
+```{r}
+cm_knn_40 |> 
+  summary() |>
+  filter(.metric %in% c("ppv", "npv")) |>  
+  select(-.estimator)
+
+cm_knn_40 |> 
+  summary() |> 
+  filter(.metric %in% c("sens", "spec", "bal_accuracy")) |>  
+  select(-.estimator)
+```
+
+
+**✭✭✭ You are a machine learning superstar ✭✭✭**
