@@ -1,0 +1,251 @@
+---
+title: 'Unit 9 (Advanced Models: Decision Trees, Bagging Trees, and Random Forest)'
+author: "Nicole Friedl"
+date: "`r lubridate::today()`"
+format: 
+  html: 
+    embed-resources: true
+    toc: true 
+    toc_depth: 4
+editor_options: 
+  chunk_output_type: console
+---
+
+## Assignment overview
+
+To begin, download the following from the course web book (Unit 9):
+
+* `hw_unit_09_random_forest.qmd` (notebook for this assignment)
+
+* `fifa.csv` (training & test data for this assignment)
+
+
+The data for this week's assignment provide rankings data of FIFA soccer players. While the entire database is available [online][https://www.fifaindex.com/], we subsetted the data down to a random sample of 2000 players for the sake of computational costs.
+
+The outcome variable in this dataset, `overall` is the overall quality rating for the player out of 100. This file also includes 15 predictor variables that describe differing attributes of each player (e.g., `age`, `nationality`, `dribbling`) as well as an ID variable listing the `name` of the player.
+
+The goal of this assignment is to build decision tree and random forest regression models to predict overall player quality of FIFA soccer players.
+
+Let's get started!
+
+-----
+
+## Setup
+
+Be sure to initiate parallel processing and set up your path
+```{r}
+options(conflicts.policy = "depends.ok")
+devtools::source_url("https://github.com/jjcurtin/lab_support/blob/main/fun_ml.R?raw=true")
+tidymodels_conflictRules()
+
+library(tidyverse)
+library(tidymodels)
+library(janitor)
+library(ranger)
+library(xfun, include.only = "cache_rds")
+
+
+devtools::source_url("https://github.com/jjcurtin/lab_support/blob/main/fun_plots.R?raw=true")
+devtools::source_url("https://github.com/jjcurtin/lab_support/blob/main/fun_eda.R?raw=true")
+
+options(tibble.width = Inf, dplyr.print_max=Inf)
+rerun_setting <- FALSE
+
+cl <- parallel::makePSOCKcluster(parallel::detectCores(logical = FALSE))
+doParallel::registerDoParallel(cl)
+
+path_data <- "homework/data"
+```
+
+## Prep data
+
+Prepare the data to be used to fit a decision tree and random forest model to predict `overall` from all predictor variables. 
+
+* Make sure variable names are clean
+
+* Make sure your code is reproducible
+
+* Split your data into `overall` training and test sets
+
+* Set up a recipe that works for both a decision tree and random forest to predict `overall` from all predictor variables. Include the minimum necessary steps you would need in your recipe to fit each model (i.e., do the fewest amount of feature engineering steps possible; you do not need to do any additional/advanced feature engineering)
+
+```{r}
+set.seed(123)
+
+data <- read_csv(here::here(path_data, "fifa.csv"), show_col_types = FALSE) |> 
+  clean_names()
+
+data <- data |> 
+  mutate(across(where(is.character), as.factor))
+
+data_split <- initial_split(data, prop = 0.8, strata = overall)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+fifa_rec <- recipe(overall ~ ., data = train_data) |> 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) |>  
+  step_normalize(all_numeric_predictors()) |>  
+  step_zv(all_predictors())  
+
+fifa_rec
+```
+
+## Decision Tree
+
+Fit a decision tree to predict `overall` from all predictor variables in your training data.
+
+* Use the `rpart` engine
+
+* Use `rmse` as your metric
+
+* Tune on `cost_complexity` and `min_n` using 100 bootstraps. Set `tree_depth` to 10 (Practically, you would never do this. This is just to lower run time of your models)
+
+* Provide visualization(s) (graph(s)) to support that you considered a wide enough range of  hyperparameter values
+
+* Print your best hyperparameter values and the held out/out of bag training RMSE
+
+```{r}
+set.seed(123)
+
+tree_spec <- decision_tree(
+  tree_depth = 10,  
+  cost_complexity = tune(),  
+  min_n = tune()  
+) |> 
+  set_engine("rpart") |> 
+  set_mode("regression")
+
+set.seed(123)
+splits_boot <- bootstraps(train_data, times = 100, strata = "overall")
+
+tree_wf <- workflow() |> 
+  add_recipe(fifa_rec) |> 
+  add_model(tree_spec)
+
+set.seed(123)
+tree_tune <- tune_grid(
+  tree_wf,
+  resamples = splits_boot,
+  grid = 10,  
+  metrics = metric_set(rmse)  
+)
+
+
+best_tree <- tree_tune |> 
+  collect_metrics() |> 
+  arrange(mean) |> 
+  slice(1)  
+
+print(best_tree)
+
+final_tree <- finalize_workflow(tree_wf, best_tree)
+
+final_tree_fit <- final_tree |> fit(data = train_data)
+
+final_tree_fit$fit |> rpart.plot::rpart.plot()
+```
+
+## Random Forest
+
+Now let's see what bagging and decorrelating can do for this model. Fit a random forest model to predict `overall` from all predictor variables in your training data.
+
+* Use the `ranger` engine
+
+* Use `rmse` as your metric
+
+* Tune on `mtry` and `min_n` using 100 bootstraps. Set `trees` to 100 (Practically, you would never do this. This is just to lower run time of your models)
+
+* Provide visualization(s) (graph(s)) to support that you considered a wide enough range of  hyperparameter values
+
+* Print your best hyperparameter values and the held out/out of bag training RMSE
+
+```{r}
+set.seed(123)
+
+data <- data %>%
+  select(-name)
+
+data <- data %>%
+  mutate(across(where(is.character), as.factor))
+
+set.seed(123)
+data_split <- initial_split(data, prop = 0.8)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+rf_recipe <- recipe(overall ~ ., data = train_data) |> 
+  step_dummy(all_nominal_predictors()) |> 
+  step_normalize(all_numeric_predictors())
+
+rf_model <- rand_forest(
+  mode = "regression",
+  mtry = tune(),
+  min_n = tune(),
+  trees = 100
+) |> 
+  set_engine("ranger")
+
+rf_workflow <- workflow() |> 
+  add_model(rf_model) |> 
+  add_recipe(rf_recipe)
+
+set.seed(123)
+rf_resamples <- bootstraps(train_data, times = 100)
+
+rf_grid <- grid_regular(
+  mtry(range = c(2, ncol(train_data) - 1)),
+  min_n(range = c(2, 20)),
+  levels = 5
+)
+
+set.seed(123)
+rf_tune_results <- tune_grid(
+  rf_workflow,
+  resamples = rf_resamples,
+  grid = rf_grid,
+  metrics = metric_set(rmse)
+)
+
+rf_tune_results %>%
+  collect_metrics() %>%
+  ggplot(aes(x = mtry, y = mean, color = factor(min_n))) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Random Forest Tuning Results",
+       x = "mtry",
+       y = "RMSE",
+       color = "min_n") +
+  theme_minimal()
+
+best_params <- select_best(rf_tune_results, "rmse")
+print(best_params)
+
+final_rf_model <- finalize_workflow(rf_workflow, best_params)
+
+final_rf_fit <- fit(final_rf_model, data = train_data)
+
+final_rf_fit %>%
+  pull_workflow_fit() %>%
+  pluck("fit") %>%
+  pluck("prediction.error") %>%
+  sqrt() %>%
+  print()
+```
+
+## 4. Evaluate best model in test
+
+* Select your best model based on bootstrapped performance in the training data
+
+* Evaluate the performance of this best model in your held out test set
+
+* Print the RMSE of your best model in test
+
+* Provide a visualization (graph) of your model's performance in test
+
+```{r}
+
+
+
+```
+
+Great Work!
