@@ -1,0 +1,268 @@
+---
+title: "Homework Unit 2: EDA Modeling"
+author: "Nicole Friedl"
+date: "`r lubridate::today()`"
+format: 
+  html: 
+    embed-resources: true
+    toc: true 
+    toc_depth: 4
+editor_options: 
+  chunk_output_type: console
+---
+
+## Introduction
+
+Welcome to the second half of the Unit 2 EDA homework. We are glad you are here. As will become the standard, please enter your first and last name at the top of this document in the same way you did on the other part of this assignment.
+
+Now that you've cleaned the data, it is time to start your modeling exploratory data analysis (EDA). Keep in mind that cleaning/ EDA is an iterative process -- you may uncover additional data errors at this stage that should be subsequently corrected in your cleaning script. Its worth the effort to keep these scripts separate to avoid accidentally gleaning information that might inappropriately guide transformations or other feature engineering from outside of your training data.
+
+## Packages, Source, Etc
+
+This code chunk will set up conflict policies to reduce errors associated with function conflicts
+```{r conflicts}
+options(conflicts.policy = "depends.ok")
+devtools::source_url("https://github.com/jjcurtin/lab_support/blob/main/fun_ml.R?raw=true")
+tidymodels_conflictRules()
+```
+
+This code chunk loads all packages you will need for this assignment.  
+```{r packages}
+#| message: false
+#| warning: false
+library(kableExtra, exclude = "group_rows") # you may or may not use this one!
+library(cowplot, include.only = c("plot_grid", "theme_half_open"))
+library(corrplot, include.only = "corrplot.mixed") # or just use namespace 
+library(tidyverse) # for general data wrangling
+library(tidymodels) # for modeling
+```
+
+Source John's function scripts
+```{r source}
+#| message: false
+#| warning: false
+devtools::source_url("https://github.com/jjcurtin/lab_support/blob/main/fun_eda.R?raw=true")
+devtools::source_url("https://github.com/jjcurtin/lab_support/blob/main/fun_plots.R?raw=true")
+``` 
+
+Set up some other environment settings 
+```{r}
+options(tibble.width = Inf, tibble.print_max = Inf)
+theme_set(theme_half_open()) # maybe you prefer this to classic theme?
+```
+
+In the chunk below, set path_data to the location of your cleaned data files.  
+```{r path}
+path_data <- "homework/data"
+```
+
+
+## Read and set up data
+
+### Read data
+
+Load the cleaned training dataset and do skim/glimpse it to get oriented.
+```{r load-data}
+data_trn <- read_csv(here::here(path_data, "ames_clean_class_trn.csv"),
+                     show_col_types = FALSE) |> 
+  glimpse()
+```
+**JUST TO PREFACE: I wanted to code my own plots because I like doing them and I like the practice.**
+
+### Set up variable classes 
+
+As before, set up all categorical variables as factors (and confirm order if needed) and set up interval/ration variables as numeric
+```{r reclass-predictors}
+data_trn <- data_trn |> 
+  mutate(
+    neighborhood = factor(neighborhood),
+    ms_sub_class = factor(ms_sub_class),
+    bsmt_qual = factor(bsmt_qual, levels = c("no_basement", "fa", "ta", "gd", "ex")),
+    central_air = factor(central_air, levels = c("n", "y")),
+    fireplace_qu = factor(fireplace_qu, levels = c("no_fireplace", "po", "fa", "ta", "gd", "ex"))
+  )
+
+data_trn <- data_trn |> 
+  mutate(
+    sale_price = as.numeric(sale_price),
+    garage_area = as.numeric(garage_area),
+    total_bsmt_sf = as.numeric(total_bsmt_sf),
+    tot_rms_abv_grd = as.numeric(tot_rms_abv_grd),
+    fireplaces = as.numeric(fireplaces)
+  )
+
+str(data_trn)
+```
+
+## 4 Univariate Distributions
+
+### Numeric variables
+
+First examine the univariate distributions of your numeric variables. Use `map()` to iterate through all numeric variables and create a `plot_grid` in a single piped chain. Describe what you discover about your data.
+
+```{r univariate-numeric}
+numeric_vars <- names(select(data_trn, where(is.numeric)))
+
+plots <- map(numeric_vars, ~ggplot(data_trn, aes(x = .data[[.x]])) + 
+                geom_histogram(binwidth = 50, fill = "hotpink", color = "orange", alpha = 0.7) + 
+                theme_minimal() +
+                labs(title = paste("Distribution of", .x), x = .x, y = "Frequency"))
+
+
+patchwork::wrap_plots(plots, ncol = 2)
+```
+
+**Numeric univariate notes:**
+*For Sale Price, the histogram is heavily skewed to the right, indicating that most houses have lower sale prices, while a few have very high prices. Garage area, The histogram is also skewed to the right, but not as strongly as the sale price. This suggests that most houses have smaller garages, while some have larger ones. Totale basement square footage, the histogram is skewed to the right, similar to garage area. For total rooms, This histogram is unusual as it seems to have a range of values outside the expected range for the number of rooms in a house. As for fireplaces, this histogram also seems to have a range of values outside the expected range for the number of fireplaces in a house.*
+
+
+### Categorical variables
+
+Now examine univariate distributions of your categorical variables. Use `map()` to iterate through all categorical variables and display them together using `plot_grid()`. Comment below on what stands out to you from these plots. Document the questions that arise from inspecting the data in this way.
+
+```{r univariate-cat}
+categorical_vars <- select(data_trn, where(is.factor)) |> names()
+
+cat_plots <- map(categorical_vars, ~ ggplot(data_trn, aes_string(x = .x)) + 
+                   geom_bar(fill = "skyblue", color = "yellow", alpha = 0.7) + 
+                   theme_minimal() +
+                   labs(title = paste("Distribution of", .x), x = .x, y = "Count"))
+
+plot_grid(plotlist = cat_plots, ncol = 2)
+```
+
+**Univariate categorical variable notes:** 
+*For distribution of neighborhood, the distribution appears to be multimodal, with several peaks. This indicates that some neighborhoods have a higher concentration of houses compared to others. Ms_sub_class depicts that the distribution is also multimodal, suggesting that certain property types are more common than others. Bsmt_qual's distribution is skewed to the right, with most houses having a basement quality of "TA" (average), and fewer houses having higher or lower qualities. For central_air, the distribution is highly skewed to the right, indicating that a large majority of houses have central air conditioning. Lastly, fireplace_qu distribution is skewed to the right, with most houses having no fireplace or having a fireplace of average quality.*
+
+## Bivariate Relationships
+
+### Numeric variables
+
+Examine the relationship between numeric predictors and the outcome variable `sale_price`. You can use `map()` again to complete these in a single pipe -- just make sure to specify `sale_price` as your `y` value. 
+
+What relationships appear promising to you? Do you have any ideas about unexpected distributional shapes? Try looking at transformations, filtering the data, or other methods that come to mind.
+```{r bivariate-num}
+numeric_vars <- select(data_trn, where(is.numeric)) |> names()
+
+numeric_plots <- map(numeric_vars, ~ ggplot(data_trn, aes_string(x = .x, y = "sale_price")) + 
+                        geom_point(alpha = 0.6) + 
+                        theme_minimal() +
+                        labs(title = paste("Sale Price vs", .x), x = .x, y = "Sale Price") +
+                        geom_smooth(method = "lm", color = "cyan", se = FALSE))
+
+plot_grid(plotlist = numeric_plots, ncol = 2)
+```
+
+**Bivariate relationship notes:** 
+*Our promising relationships include Sale Price vs. sale_price: This plot is expected to show a strong positive correlation, as it's essentially plotting the sale price against itself. Sale Price vs. garage_area: This plot suggests a moderate positive correlation. Houses with larger garage areas tend to have higher sale prices. This makes sense intuitively. Sale Price vs. total_bsmt_sf: This plot also shows a moderate positive correlation. Unexpectedly, Sale Price vs. tot_rms_abv_grd: The scatter plot here is quite interesting. It seems to show a step-like pattern, where the sale price increases in steps as the number of rooms above grade increases. This might suggest that there are price thresholds associated with certain numbers of rooms. I would maybe try binning tot_rms_abv_grd? Sale Price vs fireplaces, this plot is also interesting. It shows a very high concentration of data points at the lower end of the fireplace count. This might indicate that a large proportion of houses have no fireplaces or only one. Transformations: For variables like garage_area and total_bsmt_sf, which might have skewed distributions, transformations like logarithmic or square root transformations could be applied to see if they improve the linearity of the relationship with sale price. Filtering: It might be worthwhile to filter out outliers or extreme values in some of these variables to see if they have a significant impact on the observed relationships.* 
+
+
+### Correlations
+
+Convert any ordinal predictors to numeric, `select()` down to numeric variables, and plot all variable correlations with `sale_price`. What correlations stand out to you?
+```{r correlations}
+data_trn <- data_trn |> 
+  mutate(
+    bsmt_qual = recode(bsmt_qual, "no_basement" = 0, "fa" = 1, "ta" = 2, "gd" = 3, "ex" = 4),
+    fireplace_qu = recode(fireplace_qu, "no_fireplace" = 0, "po" = 1, "fa" = 2, "ta" = 3, "gd" = 4, "ex" = 5)
+  )
+
+numeric_vars <- select(data_trn, where(is.numeric))
+
+library(GGally)
+numeric_vars <- select(data_trn, sale_price, where(is.numeric))
+
+ggpairs(numeric_vars, upper = list(continuous = "points"))
+```
+**Correlation notes:**
+*Best correlations: Sale Price vs. sale_price: As expected, this diagonal plot shows a perfect positive correlation as it's plotting the variable against itself. Sale Price vs. garage_area: This plot indicates a moderate positive correlation. Houses with larger garage areas tend to have higher sale prices. This aligns with our previous observation. Sale Price vs. total_bsmt_sf: This plot also shows a moderate positive correlation, suggesting that houses with larger basements generally command higher prices. Sale Price vs. tot_rms_abv_grd: This plot is still quite interesting, showing a step-like pattern, where the sale price increases in steps as the number of rooms above grade increases.* 
+
+### Categorical variables
+
+Now choose the best plot(s) to visualize the relationship between your categorical predictors and `sale_price()`. What relationships stand out to you? 
+```{r bivariate-cat}
+cat_vars <- select(data_trn, where(is.factor))
+
+plot_list_cat <- map(names(cat_vars), function(var) {
+  ggplot(data_trn, aes_string(x = var, y = "sale_price")) + 
+    geom_boxplot() + 
+    labs(title = paste("Sale Price vs.", var))
+})
+
+plot_grid(plotlist = plot_list_cat, ncol = 3)
+
+
+plot_list_violin <- map(names(cat_vars), function(var) {
+  ggplot(data_trn, aes_string(x = var, y = "sale_price")) + 
+    geom_violin() + 
+    labs(title = paste("Sale Price vs.", var))
+})
+
+plot_grid(plotlist = plot_list_violin, ncol = 3)
+
+plot_list_bar <- map(names(cat_vars), function(var) {
+  data_trn |> 
+    group_by(.data[[var]]) |> 
+    summarise(mean_sale_price = mean(sale_price, na.rm = TRUE)) |> 
+    ggplot(aes_string(x = var, y = "mean_sale_price")) + 
+    geom_bar(stat = "identity") + 
+    labs(title = paste("Mean Sale Price vs.", var))
+})
+
+plot_grid(plotlist = plot_list_bar, ncol = 3)
+```
+
+**Categorical bivariate notes:** 
+*Mean Sale Price vs. neighborhood: The plots show that the mean sale price varies significantly across different neighborhoods. Some neighborhoods have considerably higher mean sale prices compared to others. This suggests that neighborhood is a strong factor influencing house prices. Mean Sale Price vs. ms_sub_class:  Similarly, the mean sale price varies across different property types (represented by ms_sub_class). This indicates that the type of property (e.g., single-family, duplex, etc.) also plays a significant role in determining the sale price. Mean Sale Price vs. central_air:  The plots show a clear difference in mean sale prices between houses with and without central air conditioning. Houses with central air conditioning tend to have higher mean sale prices. This suggests that central air is a desirable feature that can increase a house's value.* 
+
+### Guided categorical exploration
+
+`ms_sub_class` is a mysterious variable -- take a closer look at it's relationship with `sale_price`. Be sure that you are examining both the variable distribution as well as the relationship with `sale_price`. You may also find it helpful to consult the data dictionary to see what types of homes the numeric codes represent. 
+
+Do some types of homes generally sell for more than others? Is there anything surprising to you? (You may find it useful to order your `ms_sub_class` factor based on the values of `sale_price`)
+```{r cat-explore}
+ggplot(data_trn, aes(x = ms_sub_class)) + 
+  geom_bar() +
+  labs(title = "Distribution of MS Sub Class", x = "MS Sub Class", y = "Count")
+
+
+ggplot(data_trn, aes(x = ms_sub_class, y = sale_price)) + 
+  geom_boxplot() + 
+  labs(title = "Sale Price by MS Sub Class", x = "MS Sub Class", y = "Sale Price")
+
+
+data_trn <- data_trn |> 
+  mutate(
+    ms_sub_class = fct_reorder(ms_sub_class, sale_price, .fun = median)
+  )
+
+ggplot(data_trn, aes(x = ms_sub_class, y = sale_price)) + 
+  geom_boxplot() + 
+  labs(title = "Sale Price by MS Sub Class (Reordered)", x = "MS Sub Class", y = "Sale Price") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+**Guided categorical exploration notes:** 
+*There are a few MS Sub Classes with notably high median sale prices and a wider range, suggesting that these types of homes generally sell for more. However, there are some classes with lower median sale prices and a narrower range, indicating that these types of homes tend to sell for less. Some surprises: There are some outliers in several classes, indicating that there are a few homes within these classes that sold for significantly higher or lower prices than the typical range. It would be interesting to investigate these outliers to understand the factors contributing to their unusual sale prices.* 
+
+
+### Categorical/categorical relationships
+
+Use this space to examine how the relationship between `ms_sub_class` and `sale_price` might be related to another categorical variable in our data. You may choose any categorical variable that you think might help you better understand `ms_sub_class`. Are you noticing any patterns across levels?
+```{r cat-cat}
+ggplot(data_trn, aes(x = ms_sub_class, y = sale_price, fill = neighborhood)) + 
+  geom_boxplot() + 
+  labs(title = "Sale Price by MS Sub Class and Neighborhood", x = "MS Sub Class", y = "Sale Price") + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+**Cat/Cat Notes:** 
+*For a given MS Sub Class, the sale prices can vary significantly across different neighborhoods. This is seen by comparing the positions of the boxes for the same MS Sub Class across different neighborhoods. Some neighborhoods consistently have higher or lower sale prices for a particular MS Sub Class. The plot suggests an interaction effect between MS Sub Class and Neighborhood. This means that the relationship between MS Sub Class and sale price is not the same across all neighborhoods. Within each MS Sub Class, there is considerable variation in sale prices.* 
+
+## Save, render, pause
+### Save
+Save this `.qmd` file with your last name at the end (e.g. `hw_unit_2_modeling_santana.Rmd`).
+
+### Render 
+Render the file to html and upload your html file to Canvas. 
+
+### Pause
+Pause for a moment. Feel good about what you've done. You have completed your first IAML assignment. This is important and we are proud of you.
