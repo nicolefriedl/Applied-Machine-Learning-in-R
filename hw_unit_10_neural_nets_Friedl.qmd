@@ -1,0 +1,245 @@
+---
+title: "Homework Unit 10: Neural Networks"
+author: "Nicole Friedl"
+date: "`r lubridate::today()`"
+format: 
+  html: 
+    embed-resources: true
+    toc: true 
+    toc_depth: 4
+editor_options: 
+  chunk_output_type: console
+---
+
+## Introduction
+
+To begin, download the following from the course web book (Unit 10):
+
+* `hw_unit_10_neural_nets.qmd` (notebook for this assignment)
+
+* `wine_quality_trn.csv` and `wine_quality_test.csv` (data for this assignment)
+
+The data for this week's assignment include wine quality ratings for various white wines. The outcome is `quality` - a categorical ("high_quality" or "low_quality") outcome. There are 11 numeric predictors that describe attributes of the wine (e.g., acidity) that may relate to the overall quality rating. 
+
+We will be doing another competition this week. You will fit a series of neural network model configurations and select the best configuration among them. You will use the `wine_quality_test.csv` file **only once** at the end of the assignment to generate your best model's predictions in the held-out test set (the test set will not include outcome labels). We will assess everyone's predictions on the held-out set to determine the best fitting model in the class. **The winner again gets a free lunch from John!**
+
+Note that this week's assignment is less structured than previous assignments, allowing you to make more independent decisions about how to approach all aspects of the modeling process. Try to use the knowledge that you have developed from the work in previous assignments to explore your data, generate features, and examine different model configurations.
+
+Let's get started!
+
+## Setup
+
+Set up your notebook in this section. You will want to be sure to set your `path_data` and initiate parallel processing here!
+
+```{r}
+options(conflicts.policy = "depends.ok")
+devtools::source_url("https://github.com/jjcurtin/lab_support/blob/main/fun_ml.R?raw=true")
+tidymodels_conflictRules()
+
+library(tidyverse)
+library(keras, exclude = "get_weights")
+library(magrittr, exclude = c("set_names", "extract"))
+library(rsample)
+library(parsnip)
+library(recipes)
+library(workflows)
+
+
+devtools::source_url("https://github.com/jjcurtin/lab_support/blob/main/fun_plots.R?raw=true")
+devtools::source_url("https://github.com/jjcurtin/lab_support/blob/main/fun_eda.R?raw=true")
+options(tibble.width = Inf, dplyr.print_max=Inf)
+rerun_setting <- FALSE
+
+cl <- parallel::makePSOCKcluster(parallel::detectCores(logical = FALSE))
+doParallel::registerDoParallel(cl)
+
+path_data <- "homework/data"
+```
+
+
+
+## Expectations for minimum model requirements
+
+Across the model configurations you compare, you must fit models that vary with respect to:
+
+* Hidden layer architecture: Consider **at least two** different numbers of units within the hidden layer.
+
+* Controlling overfitting: Consider **at least one** method to control overfitting (either L2 regularization or drop-out) with **at least two** associated hyperparameter values.
+
+* Hidden layer activation function: Consider **at least two** activation functions for the hidden layer.
+
+### Some things to consider
+#### About configurations
+Of course you can't choose between model configurations based on training set performance, so you'll need to use some resampling technique. There are different costs and benefits associated with different resampling techniques (e.g., bias, variance, computing time), so you'll need to decide which technique is the best for your needs for this assignment. Specifically, you should choose among a validation split, k-fold cross-validation, or bootstrapping for cross-validation.
+
+#### Resampling and tuning
+Given what you've learned about resampling/tuning, think about how you might move systematically through model configurations rather than haphazardly changing model configuration characteristics.
+
+#### Consider compute time
+As you weigh computing costs, think about what that might look like given your current context. For example, imagine that each model configuration takes 2 minutes to fit. If you want to use 100 bootstraps for CV, that means ~200 minutes (just over 3 hours) per model configuration. Now imagine you're comparing 8 different model configurations. That multiplies your 200 minutes by 8, which starts to get pretty long. If you're using 10-fold CV, that means it only takes 20 minutes per model configuration, so you might be able to compare more configurations. A validation split would be even simpler. Think about the costs and benefits of each approach, pick one and motivate it with commentary in your submission.
+
+#### Performance metric: accuracy
+Regardless of the resampling technique you choose, please compare models using **accuracy** as your performance metric.
+
+Okay, now onto some EDA and then modeling...
+
+## Feature engineering
+Read in `wine_quality_trn.csv`
+```{r}
+data_trn <- data_trn <- read_csv("/Users/nicolefriedl/Desktop/Psych752/homework/data/wine_quality_trn.csv")
+
+glimpse(data_trn)
+```
+
+Perform some modeling EDA. How will you scale your features? Should your features be normalized, scaled, or transformed in some other way? Decorrelated? Provide an explanation for your decisions here along with as much EDA as you find necessary.
+
+To ensure our neural network performs optimally, I will standardize most features using Z-score scaling, as many follow a roughly normal distribution. However, highly skewed features like chlorides, residual_sugar, free_sulfur_dioxide, and total_sulfur_dioxide will be log-transformed to reduce skewness and improve model stability. Standardization ensures all features contribute equally, preventing those with larger magnitudes from dominating the model. I also checked feature correlations and may consider removing or combining highly correlated variables to reduce redundancy and improve generalization.
+```{r}
+data_trn %>%
+  count(quality) %>%
+  mutate(prop = n / sum(n))
+
+data_trn %>%
+  select(-quality) %>%
+  summary()
+
+data_trn %>%
+  pivot_longer(-quality, names_to = "Feature", values_to = "Value") %>%
+  ggplot(aes(x = Value)) +
+  geom_histogram(bins = 30, fill = "hotpink", alpha = 0.7) +
+  facet_wrap(~Feature, scales = "free") +
+  theme_minimal()
+
+cor_matrix <- cor(data_trn %>% select(-quality))
+corrplot::corrplot(cor_matrix, method = "color", type = "lower")
+
+```
+
+
+## Fit models
+Depending on the resampling technique you choose and how you plan to examine various model configurations, your code set-up is going to look different. Create as many code chunks as needed for whatever your approach. 
+
+Where needed, please include some annotation (in text outside of code chunks and/or in commented lines within code chunks) to help us review your assignment. You don't need to tell us everything you're doing because that should be relatively clear from the code! A good rule of thumb is to use annotation to tell us **why** you're doing something (e.g., if you had several choices for how to proceed, why did you choose the one you did?) but you don't have to describe **what** you're doing (e.g., you don't need to tell us you're building a recipe - we will see that in your code). 
+
+For my neural network modeling approach, I decided to use a validation split strategy that would allow me to efficiently tune hyperparameters while maintaining a test set for final evaluation. I set up a structured workflow that includes data preprocessing, model specification, hyperparameter tuning, and final model fitting. I began by creating a reproducible environment with a fixed random seed and splitting my data into training and validation sets with an 80-20 split. For my recipe, I applied log transformations to variables with potential skewness (residual_sugar, free_sulfur_dioxide, and total_sulfur_dioxide) to improve the neural network's performance on these typically right-skewed features. I also normalized all numeric predictors to ensure they're on the same scale, which is crucial for neural network convergence.
+
+I chose to create a multilayer perceptron with tunable hyperparameters including: Hidden units (network width), dropout rate (regularization), activation function. I fixed the epochs at 30 to prevent overfitting while still allowing sufficient training, and set the batch size to 32 to balance computation efficiency and gradient accuracy.
+
+I chose to test: Two network sizes (10 and 20 hidden units) to compare simpler vs. more complex architectures Dropout vs. no dropout (0 vs. 0.3) to evaluate regularization benefits ReLU vs. sigmoid activation functions to compare modern vs. traditional activation approaches. For the validation strategy, I implemented another validation split within the training data to avoid touching my final test set during tuning. This approach balances computational efficiency with thorough exploration of key neural network parameters, focusing on accuracy as the primary metric for wine quality classification.
+```{r}
+set.seed(123)
+
+data_split <- initial_split(data_trn, prop = 0.8)
+train_data <- training(data_split)
+val_data <- testing(data_split)
+
+recipe_nn <- recipe(quality ~ ., data = train_data) %>%
+  step_log(residual_sugar, free_sulfur_dioxide, total_sulfur_dioxide, offset = 1) %>%
+  step_normalize(all_numeric_predictors())
+
+nn_spec <- mlp(
+  hidden_units = tune(),
+  dropout = tune(),
+  activation = tune(),
+  epochs = 30    
+) %>%
+  set_engine("keras", batch_size = 32) %>%  
+  set_mode("classification")
+```
+
+```{r}
+nn_wf <- workflow() %>%
+  add_recipe(recipe_nn) %>%
+  add_model(nn_spec)
+```
+
+```{r}
+library(dials)
+library(tune)
+nn_grid <- expand_grid(
+  hidden_units = c(10, 20),
+  dropout = c(0, 0.3),
+  activation = c("relu", "sigmoid")
+)
+
+nn_results <- nn_wf %>%
+  tune_grid(
+    resamples = validation_split(train_data, prop = 0.8),
+    grid = nn_grid,
+    metrics = yardstick::metric_set(yardstick::accuracy),
+    control = control_grid(verbose = TRUE)
+  )
+```
+
+```{r}
+show_best(nn_results, metric = "accuracy")
+
+best_nn <- finalize_workflow(nn_wf, select_best(nn_results, metric = "accuracy"))
+```
+
+```{r}
+final_nn_fit <- fit(best_nn, data = data_trn)
+```
+
+## Generate predictions
+This section is for generating predictions for your best model in the held-out test set. You should only generate predictions for **one model** out of all configurations you examined. We will use these predictions to generate your one estimate of model performance in the held-out data.
+
+Add your last name between the quotation marks to be used in naming your predictions file.
+```{r}
+last_name <- "Friedl"
+```
+
+### Read in test data
+Read in the `wine_quality_test.csv` file.
+```{r}
+data_test <- read_csv("/Users/nicolefriedl/Desktop/Psych752/homework/data/wine_quality_test.csv")
+```
+
+### Make feature matrices
+Make training feature matrix using your best recipe. 
+```{r}
+feat_trn_best <- recipe_nn %>%
+  prep(training = data_trn) %>%
+  bake(new_data = data_trn)
+```
+
+Make test feature matrix using your best recipe.
+```{r}
+feat_test_best <- recipe_nn %>%
+  prep(training = data_trn) %>%
+  bake(new_data = data_test)
+```
+
+### Fit best model
+Fit your best model in `feat_trn_best.csv` (no resampling). 
+```{r}
+best_params <- select_best(nn_results, metric = "accuracy")
+
+best_model <- mlp(
+  hidden_units = best_params$hidden_units,
+  dropout = best_params$dropout,
+  activation = best_params$activation,
+  epochs = 30
+) %>%
+  set_engine("keras", batch_size = 32) %>%
+  set_mode("classification") %>%
+  fit(quality ~ ., data = feat_trn_best)
+```
+
+### Generate test predictions
+Run this code chunk to save out your best model's predictions in the held-out test set. Look over your predictions to confirm your model generated valid predictions for each test observation. Make sure the file containing your predictions has the form that you think it should. This requires visually inspecting the output csv file after you write it. The `glimpse()` call helps too.
+```{r}
+library(here)
+feat_test_best %>% 
+  mutate(quality = predict(best_model, feat_test_best)$.pred_class) %>% 
+  select(quality) %>% 
+  glimpse() %>% 
+  write_csv(here(path_data, str_c("test_preds_", last_name, ".csv")))
+```
+
+## Save & render
+Render this .qmd file with your last name at the end (e.g., hw_unit_10_neural_nets_name.qmd). Make sure you changed "Your name here" at the top of the file to be your own name. Render the file to html. Upload the rendered file and your saved test_preds_lastname.csv to Canvas.  
+
+We will assess everyone's predictions in the test, and the winner gets a free lunch from John!
+
+**Way to go!!**
