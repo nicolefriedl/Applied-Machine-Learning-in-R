@@ -16,7 +16,6 @@ The course focuses on:
 Each assignment folder typically includes:
 - `.qmd` file: the Quarto source file with embedded R code and narrative
 - `.pdf` file: the rendered version of the Quarto file, formatted for submission
-- Any related datasets, scripts, or visualizations used in the assignment
 
 ## Purpose
 
