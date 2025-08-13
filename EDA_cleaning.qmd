@@ -1,6 +1,6 @@
 ---
 title: 'Unit 4 (Classification): Cleaning EDA'
-author: "Your Name"
+author: "Nicole Friedl"
 date: "`r lubridate::today()`"
 format: 
   html: 
